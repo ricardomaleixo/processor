@@ -1,0 +1,2 @@
+Status;Status reason;Quantity;Part;Material;Thickness;Min Bounding box Width;Min Bounding box Height;Bounding box 3D Width;Bounding box 3D Height;Bounding box 3D Depth;Cutting length;Number of contours;Number of bends;Number of bend sequences;Length longest bend;Force longest bend;Netto area;Bruto area;Mass;Cutting;Schema;Description;Volume
+Finished;;1;004300;;1.0;71.59;92.45;71.59;92.45;59.7;0;19;84;22;75.0;11.25;12100.889;6618.777;0.121;00:00:00;AUTOMOTIVE_DESIGN {1 0 10303 214 3 1 1};;15326.768
