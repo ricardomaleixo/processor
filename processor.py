@@ -35,7 +35,6 @@ def _parse_metadata_from_file_text(file_path: str) -> dict:
       usando o padrão: 'Material=..., Quantity=..., Status=..., StatusReason=...'
     """
 
-    # Valores padrão
     metadata = {
         "Part": os.path.basename(file_path).split(".")[0],
         "Material": "",
@@ -46,15 +45,13 @@ def _parse_metadata_from_file_text(file_path: str) -> dict:
         "Raw description": "",
     }
 
-    # Lê o arquivo STEP como texto
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
     except Exception:
-        # Se der qualquer problema ao ler o texto, volta só com os defaults
         return metadata
 
-    # Isola o HEADER; ...; ENDSEC;
+    # HEADER ... ENDSEC;
     m_header = re.search(
         r"HEADER\s*;(.*?);ENDSEC\s*;",
         content,
@@ -62,19 +59,14 @@ def _parse_metadata_from_file_text(file_path: str) -> dict:
     )
     header = m_header.group(1) if m_header else content
 
-    # ------------------------------------------------------------------
-    # 1) FILE_NAME('Nome da peça', ...)
-    # ------------------------------------------------------------------
+    # FILE_NAME('Nome', ...)
     m_name = re.search(r"FILE_NAME\s*\(\s*'([^']*)'", header, re.IGNORECASE)
     if m_name:
         name = m_name.group(1).strip()
         if name:
             metadata["Part"] = name
 
-    # ------------------------------------------------------------------
-    # 2) FILE_DESCRIPTION(('Texto aqui'),'2;1');
-    #    Ex: FILE_DESCRIPTION(('Material=INOX 304; Quantity=2; Status=Finished'),'2;1');
-    # ------------------------------------------------------------------
+    # FILE_DESCRIPTION(('Texto'),...)
     m_desc = re.search(
         r"FILE_DESCRIPTION\s*\(\s*\(\s*'([^']*)'\s*\)",
         header,
@@ -83,9 +75,7 @@ def _parse_metadata_from_file_text(file_path: str) -> dict:
     desc = m_desc.group(1).strip() if m_desc else ""
     metadata["Raw description"] = desc
 
-    # Extrai Material, Quantity, Status, StatusReason do texto da descrição
-    # Exemplo de desc:
-    #   "Material=INOX 304; Quantity=2; Status=Finished; StatusReason=Alguma coisa"
+    # Exemplo: "Material=INOX 304; Quantity=2; Status=Finished; StatusReason=..."
     matches = re.findall(r"(\w+)\s*=\s*([^;]+)", desc)
     for k, v in matches:
         k = k.strip().lower()
@@ -102,9 +92,7 @@ def _parse_metadata_from_file_text(file_path: str) -> dict:
         elif k in ("statusreason", "status_reason"):
             metadata["Status reason"] = v
 
-    # ------------------------------------------------------------------
-    # 3) FILE_SCHEMA(('algum_schema'));
-    # ------------------------------------------------------------------
+    # FILE_SCHEMA(('schema'))
     m_schema = re.search(
         r"FILE_SCHEMA\s*\(\s*\(\s*'([^']*)'\s*\)\s*\)",
         header,
@@ -127,13 +115,10 @@ def read_step_file(file_path: str):
     if status != IFSelect_RetDone:
         raise ValueError(f"Erro ao ler o arquivo STEP: {file_path}")
 
-    # Transferir as raízes para obter o shape
     reader.TransferRoots()
     shape = reader.OneShape()
 
-    # Lê metadados diretamente do texto do arquivo
     metadata = _parse_metadata_from_file_text(file_path)
-
     return shape, metadata
 
 
@@ -167,8 +152,6 @@ def face_is_plane(face) -> bool:
 def angle_between_faces(f1, f2) -> float:
     """
     Retorna o ângulo entre duas faces (em graus), no intervalo [0, 180].
-    0° = faces paralelas no mesmo sentido
-    180° = faces paralelas em sentidos opostos
     """
     surf1 = BRepAdaptor_Surface(f1)
     surf2 = BRepAdaptor_Surface(f2)
@@ -178,8 +161,7 @@ def angle_between_faces(f1, f2) -> float:
 
     dot = n1.Dot(n2)
     dot = max(-1.0, min(1.0, dot))
-    angle = math.degrees(math.acos(dot))
-    return angle
+    return math.degrees(math.acos(dot))
 
 
 def estimate_thickness(
@@ -189,8 +171,8 @@ def estimate_thickness(
     max_thickness: float = 100.0,
 ) -> float:
     """
-    Estima a espessura da peça como a menor distância entre pares de faces planas
-    aproximadamente paralelas.
+    Estima a espessura como a menor distância entre pares de faces planas
+    aproximadamente paralelas. Se não conseguir, retorna default_thickness.
     """
     if not faces:
         return default_thickness
@@ -240,7 +222,7 @@ def calculate_cutting_length(shape, planar_faces) -> float:
             e = expE.Current()
             if edge_to_faces.Contains(e):
                 faces = edge_to_faces.FindFromKey(e)
-                if faces.Size() == 1:
+                if faces.Size() == 1:  # aresta externa
                     cutting_edges.add(e)
             expE.Next()
 
@@ -268,7 +250,7 @@ def get_material_density(material: str, default_density: float = 7.9e-6) -> floa
 
 def _count_bend_sequences(bend_edges):
     """
-    Agrupa arestas de dobra em sequências contínuas.
+    Agrupa arestas de dobra em sequências contínuas (componentes conexos).
     """
     if not bend_edges:
         return 0
@@ -309,17 +291,14 @@ def _count_bend_sequences(bend_edges):
     return num_sequences
 
 
-def get_oriented_bbox_lengths(shape, linear_deflection: float = 0.1, angular_deflection: float = 0.1):
+# ----------------------------------------------------------------------
+# 2.1 – Bounding box via PCA
+# ----------------------------------------------------------------------
+def get_bbox_pca(shape, linear_deflection: float = 0.1, angular_deflection: float = 0.1):
     """
-    Calcula o bounding box ORIENTADO (OBB) usando PCA nos pontos da malha:
-
-    - Gera malha com BRepMesh_IncrementalMesh
-    - Coleta todos os nós de triangulação das faces
-    - Calcula PCA (autovetores/autovalores da matriz de covariância)
-    - Projeta pontos nos eixos principais
-    - Retorna os comprimentos ao longo de cada eixo, ordenados: (Lmax, Lmid, Lmin)
+    Bounding box ORIENTADO (OBB) usando PCA nos pontos da malha.
+    Retorna (Lmax, Lmid, Lmin).
     """
-    # Gera a malha
     mesh = BRepMesh_IncrementalMesh(shape, linear_deflection, False, angular_deflection, True)
     mesh.Perform()
 
@@ -340,7 +319,7 @@ def get_oriented_bbox_lengths(shape, linear_deflection: float = 0.1, angular_def
                 points.append([p.X(), p.Y(), p.Z()])
         expF.Next()
 
-    # Se não conseguiu pontos da malha, fallback para bbox axis-aligned
+    # Fallback: bbox axis-aligned
     if not points:
         box = Bnd_Box()
         brepbndlib.Add(shape, box)
@@ -348,30 +327,166 @@ def get_oriented_bbox_lengths(shape, linear_deflection: float = 0.1, angular_def
         dx = xmax - xmin
         dy = ymax - ymin
         dz = zmax - zmin
-        lengths = sorted([dx, dy, dz], reverse=True)
-        return tuple(lengths)  # (Lmax, Lmid, Lmin)
+        dims = sorted([dx, dy, dz], reverse=True)
+        return float(dims[0]), float(dims[1]), float(dims[2])
 
     pts = np.asarray(points, dtype=float)
 
-    # PCA
     centroid = pts.mean(axis=0)
     centered = pts - centroid
     cov = np.cov(centered, rowvar=False)
 
     eigvals, eigvecs = np.linalg.eigh(cov)
     order = np.argsort(eigvals)[::-1]
-    eigvecs = eigvecs[:, order]  # colunas = eixos principais (maior variância primeiro)
+    eigvecs = eigvecs[:, order]
 
-    # Projeta pontos nesses eixos
     coords = centered @ eigvecs
     mins = coords.min(axis=0)
     maxs = coords.max(axis=0)
-    lengths = maxs - mins  # comprimento em cada eixo principal
+    lengths = maxs - mins
 
-    # Ordena do maior para o menor
     lengths_sorted = sorted(lengths, reverse=True)
     Lmax, Lmid, Lmin = lengths_sorted
     return float(Lmax), float(Lmid), float(Lmin)
+
+
+# ----------------------------------------------------------------------
+# 2.2 – Bounding box orientado pela MAIOR face planar
+# ----------------------------------------------------------------------
+def get_bbox_main_face(shape, linear_deflection: float = 0.1, angular_deflection: float = 0.1):
+    """
+    Bounding box orientado pela MAIOR face planar.
+    Retorna (width_2d, height_2d, depth_3d) no sistema de eixos dessa face.
+    """
+    # 1) Encontrar maior face plana
+    main_face = None
+    max_area = 0.0
+
+    expF = TopExp_Explorer(shape, TopAbs_FACE)
+    while expF.More():
+        f = expF.Current()
+        if face_is_plane(f):
+            gprops = GProp_GProps()
+            brepgprop.SurfaceProperties(f, gprops)
+            area = gprops.Mass()
+            if area > max_area:
+                max_area = area
+                main_face = f
+        expF.Next()
+
+    # Se não achou face plana, cai para PCA
+    if main_face is None:
+        Lmax, Lmid, Lmin = get_bbox_pca(shape, linear_deflection, angular_deflection)
+        # aqui devolvemos 2D = duas maiores dimensões, depth = menor
+        return float(Lmid), float(Lmax), float(Lmin)
+
+    # 2) Sistema de eixos da face
+    surf = BRepAdaptor_Surface(main_face)
+    pln = surf.Plane()
+
+    origin = pln.Location()
+    x_axis = gp_Vec(pln.XAxis().Direction().XYZ())
+    y_axis = gp_Vec(pln.YAxis().Direction().XYZ())
+    z_axis = gp_Vec(pln.Axis().Direction().XYZ())  # normal
+
+    # 3) Gera malha
+    mesh = BRepMesh_IncrementalMesh(shape, linear_deflection, False, angular_deflection, True)
+    mesh.Perform()
+
+    # 4) Projeta todos os nós da malha
+    first = True
+    x_min = y_min = z_min = None
+    x_max = y_max = z_max = None
+
+    expF = TopExp_Explorer(shape, TopAbs_FACE)
+    while expF.More():
+        face = expF.Current()
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation(face, loc)
+        if tri is not None:
+            trsf = loc.Transformation()
+            for i in range(1, tri.NbNodes() + 1):
+                p = tri.Node(i)
+                if not loc.IsIdentity():
+                    p = p.Transformed(trsf)
+
+                v = gp_Vec(origin, p)
+                xx = v.Dot(x_axis)
+                yy = v.Dot(y_axis)
+                zz = v.Dot(z_axis)
+
+                if first:
+                    x_min = x_max = xx
+                    y_min = y_max = yy
+                    z_min = z_max = zz
+                    first = False
+                else:
+                    x_min = min(x_min, xx)
+                    x_max = max(x_max, xx)
+                    y_min = min(y_min, yy)
+                    y_max = max(y_max, yy)
+                    z_min = min(z_min, zz)
+                    z_max = max(z_max, zz)
+        expF.Next()
+
+    if first:
+        # se por algum motivo não coletamos pontos, fallback para PCA
+        Lmax, Lmid, Lmin = get_bbox_pca(shape, linear_deflection, angular_deflection)
+        return float(Lmid), float(Lmax), float(Lmin)
+
+    length_x = abs(x_max - x_min)
+    length_y = abs(y_max - y_min)
+    length_z = abs(z_max - z_min)
+
+    in_plane_1 = length_x
+    in_plane_2 = length_y
+    depth = length_z
+
+    # width_2d = menor lado no plano, height_2d = maior lado no plano
+    w_2d, h_2d = sorted([in_plane_1, in_plane_2])
+    return float(w_2d), float(h_2d), float(depth)
+
+
+# ----------------------------------------------------------------------
+# 2.3 – Wrapper: escolhe PCA ou face
+# ----------------------------------------------------------------------
+def get_oriented_bbox(shape, mode: str = "pca"):
+    """
+    Retorna um dict com:
+      - width
+      - height
+      - depth
+      - width_2d
+      - height_2d
+
+    mode="pca"  → usa PCA (OBB genérico)
+    mode="face" → usa a maior face planar como referência
+    """
+    mode = (mode or "pca").lower()
+
+    if mode == "face":
+        w2d, h2d, d = get_bbox_main_face(shape)
+        # três dimensões 3D reais
+        d1, d2, d3 = w2d, h2d, d
+    else:
+        # PCA
+        Lmax, Lmid, Lmin = get_bbox_pca(shape)
+        # aqui consideramos como se as duas maiores fossem "plano principal"
+        w2d, h2d = Lmid, Lmax
+        d1, d2, d3 = Lmax, Lmid, Lmin
+
+    dims3 = sorted([d1, d2, d3], reverse=True)  # [Lmax, Lmid, Lmin]
+    bbox_height = dims3[0]  # maior
+    bbox_width = dims3[1]   # intermediária
+    bbox_depth = dims3[2]   # menor
+
+    return {
+        "width": bbox_width,
+        "height": bbox_height,
+        "depth": bbox_depth,
+        "width_2d": w2d,
+        "height_2d": h2d,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -380,13 +495,15 @@ def get_oriented_bbox_lengths(shape, linear_deflection: float = 0.1, angular_def
 def get_shape_properties(
     file_path: str,
     default_thickness: float = 3.0,
+    bbox_mode: str = "pca",  # "pca" ou "face"
 ) -> dict:
     """
     Lê a peça de um arquivo STEP e calcula um conjunto de propriedades
     geométricas e tecnológicas.
 
-    Usa OBB (oriented bounding box via PCA), então os tamanhos não dependem
-    da rotação da peça no STEP.
+    bbox_mode:
+      - "pca"  → bounding box via PCA (genérico)
+      - "face" → bounding box orientado pela maior face planar
     """
     shape, metadata = read_step_file(file_path)
 
@@ -399,20 +516,13 @@ def get_shape_properties(
     brepgprop.SurfaceProperties(shape, surf_props)
     surface_area = surf_props.Mass()
 
-    # Bounding box ORIENTADO (PCA)
-    Lmax, Lmid, Lmin = get_oriented_bbox_lengths(shape)
-
-    # Mapeamento industrial:
-    #  - maior dimensão  -> Height
-    #  - intermediária   -> Width
-    #  - menor           -> Depth
-    bbox_height = Lmax
-    bbox_width = Lmid
-    bbox_depth = Lmin
-
-    # 2D (plano principal)
-    bb_2d_height = Lmax
-    bb_2d_width = Lmid
+    # Bounding box orientado conforme modo
+    bbox_info = get_oriented_bbox(shape, mode=bbox_mode)
+    bbox_width = bbox_info["width"]
+    bbox_height = bbox_info["height"]
+    bbox_depth = bbox_info["depth"]
+    bb_2d_width = bbox_info["width_2d"]
+    bb_2d_height = bbox_info["height_2d"]
 
     # Faces planas
     expF = TopExp_Explorer(shape, TopAbs_FACE)
@@ -477,9 +587,11 @@ def get_shape_properties(
         "Material": metadata.get("Material", ""),
         "Thickness": thickness,
 
+        # 2D (no plano principal escolhido pelo modo)
         "Min Bounding box Width": round(bb_2d_width, 2),
         "Min Bounding box Height": round(bb_2d_height, 2),
 
+        # 3D (ordenado: Height = maior, Width = intermediária, Depth = menor)
         "Bounding box 3D Width": round(bbox_width, 2),
         "Bounding box 3D Height": round(bbox_height, 2),
         "Bounding box 3D Depth": round(bbox_depth, 2),
